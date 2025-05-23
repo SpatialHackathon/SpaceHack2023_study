@@ -1,0 +1,706 @@
+---
+title: "Code for Figure 3 + Supp Figs"
+format: 
+    html:
+      toc: true
+      self-contained: true
+      highlight-style: github
+      code-line-numbers: true
+      code-fold: true
+editor: source
+editor_options: 
+  chunk_output_type: console
+#params:
+#  datadir: 'test'
+#  nmethod_range:
+#  ground_truth:
+#  nns: 6
+#  name: "noname"
+#  nclust_range:
+#  nsmoothest: 30
+#  obs_filter: NULL
+---
+
+## Retrieve parameters
+
+```{r display-params}
+datadir <- "data/libd-for-figure3"
+name <- "fig3"
+nclust_range <- c(5,7,9)
+nmethod_range <- 5:12
+
+
+# gt <- c("parcellation_structure","parcellation_substructure")
+# k <- 6
+# nclust_range <- c(16,20,24)
+# nmethod_range <- c(3,4,5,6,7,8,9)
+# nsmoothest <- c(30)
+# obs_filter <- 'parcellation_division=="TH" | parcellation_structure=="ZI"'
+
+# if datadir ends in `/`, it screws up the parsing of method names,
+# so add a check for it
+stopifnot(tail(strsplit(datadir,"")[[1]],1)!="/")
+
+```
+
+## Packages / functions
+
+```{r load-packages}
+suppressPackageStartupMessages({
+  library(SpatialExperiment)
+  library(dplyr)
+  library(ggplot2)
+  library(cowplot)
+  library(clue)
+  library(khroma)
+  library(scran)
+  library(limma)
+  library(tibble)
+  library(readr)
+  library(ggrepel)
+  library(mclust)
+  library(pheatmap)
+  library(fastDummies)
+  library(randomcoloR)
+  library(STexampleData)
+  library(reshape2)
+  library(ClusteringMetrics)
+  library(gridExtra)
+})
+source("utils.R")
+```
+
+
+## Load data (n.b.: not a perfect match to ExperimentHub)
+
+```{r load-data}
+
+spe <- Visium_humanDLPFC()
+
+
+# QUALITY CONTROL (QC)
+# subset to keep only spots over tissue
+spe <- spe[, colData(spe)$in_tissue == 1]
+# identify mitochondrial genes
+is_mito <- grepl("(^MT-)|(^mt-)", rowData(spe)$gene_name)
+# calculate per-spot QC metrics
+spe <- addPerCellQC(spe, subsets = list(mito = is_mito))
+# select QC thresholds
+qc_lib_size <- colData(spe)$sum < 600
+qc_detected <- colData(spe)$detected < 400
+qc_mito <- colData(spe)$subsets_mito_percent > 28
+qc_cell_count <- colData(spe)$cell_count > 10
+# combined set of discarded spots
+discard <- qc_lib_size | qc_detected | qc_mito | qc_cell_count
+colData(spe)$discard <- discard
+# filter low-quality spots
+spe <- spe[, !colData(spe)$discard]
+
+# NORMALIZATION
+# calculate logcounts using library size factors
+spe <- logNormCounts(spe)
+spe <- spe[!is_mito, ]
+
+keep <- !is.na(spe$ground_truth)
+spe <- spe[,keep]
+
+spe$col <- spatialCoords(spe)[,"pxl_row_in_fullres"]
+spe$row <- spatialCoords(spe)[,"pxl_col_in_fullres"]
+
+
+cd <- colData(spe)
+
+ggplot(cd %>% as.data.frame,
+       aes(x = row, y = col, colour=ground_truth)) +
+  geom_point() +
+  scale_y_reverse()
+
+
+
+
+base_clusterings <- read_tsv(file.path(datadir, "libd_dlpfc/Br8100_151673",
+                                       "combined_methods.tsv"),
+                             show_col_types = FALSE)
+# base_clusterings <- read_tsv(file.path(datadir, 
+#                                        "combined_methods.tsv"),
+#                              show_col_types = FALSE)
+colnames(base_clusterings)[1] <- "barcode_id"
+
+mean(cd$barcode_id %in% base_clusterings$barcode_id)
+
+mean(base_clusterings$barcode_id %in% cd$barcode_id)
+
+dim(cd)
+
+dim(base_clusterings)
+
+m <- match(cd$barcode_id, base_clusterings$barcode_id)
+sum(is.na(m))
+
+base_clusterings <- base_clusterings[m,]
+
+dim(base_clusterings)
+
+cns <- grep("_label$", colnames(base_clusterings), 
+            value = TRUE)
+ss <- strsplit(cns, "_")
+sapply(ss, length) %>% table
+keep <- sapply(ss, function(u) u[length(u)-1]) %in% nclust_range
+base_clusterings <- base_clusterings[,c("barcode_id",cns[keep])]
+
+dim(base_clusterings)
+
+colnames(base_clusterings) <- gsub("_label","", colnames(base_clusterings))
+
+# 
+# base_clusts <- base_clusterings %>% 
+#   inner_join(cd %>% as.data.frame %>% 
+#                select(barcode_id, row, col, ground_truth))
+# 
+# 
+# # quick scan
+# lapply(base_clusts, head, 2)
+
+all(base_clusterings$barcode_id == spe$barcode_id)
+
+# "-" this causes problems later (with LCA)
+colnames(base_clusterings) <- gsub("SCAN-IT", "SCANIT", 
+                                   colnames(base_clusterings))
+
+
+```
+
+
+## Smoothness-entropy of base clusterings
+
+```{r smoothness-entropy, fig.width=8, fig.height=6, eval=TRUE}
+
+rownames(base_clusterings) <- NULL
+base_clusterings <- base_clusterings %>%
+  as.data.frame %>%
+  column_to_rownames("barcode_id")
+
+# find number of actual clusters per column
+real_n <- apply(base_clusterings, 2, 
+                function(u) length(unique(u)))
+table(real_n)
+
+base_clusterings <- base_clusterings[,real_n %in% nclust_range]
+
+real_n <- apply(base_clusterings, 2, 
+                function(u) length(unique(u)))
+table(real_n)
+
+
+# focus on clusterings at single number of clusters, loop through
+p <- vector("list", length = length(nclust_range))
+count <- 1
+
+all_mses <- NULL
+k <- 6
+
+for(nclust in nclust_range) {
+
+  these_clusterings <- base_clusterings %>%
+    dplyr::select(names(which(real_n==nclust)))
+
+  coords <- colData(spe) %>% as.data.frame %>%
+    dplyr::select(barcode_id, row, col)
+
+  df <- these_clusterings %>%
+    rownames_to_column("barcode_id") %>%
+    left_join(coords, by = "barcode_id")
+
+  palette <- distinctColorPalette(nclust)
+  names(palette) <- 1:nclust
+
+  mse <- apply(these_clusterings, 2,
+               function(u) spot_entropy(coords[,c("row","col")],
+                                        u, k=k))
+  cm <- mse %>% colMeans
+  lv <- cm %>% sort %>% names
+  print(cm)
+
+  all_mses <- append(all_mses, cm)
+
+  mse_m <- melt(mse, value.name = "entropy")
+  mse_m$Var2 <- factor(mse_m$Var2, levels=lv)
+
+  mse_p <- ggplot(mse_m, aes(Var2, entropy)) +
+    geom_violin() +
+    ylab(paste0("pointwise entropy (k=", k, ")")) +
+    xlab("base clustering") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     vjust = 1, hjust=1)) +
+    geom_label(data = data.frame(Var2=names(cm),
+                                 entropy = cm, label=round(cm,4)),
+               mapping = aes(x=Var2,y=entropy,label=label), size = 2.5) +
+    scale_y_sqrt() +
+    ggtitle(paste0("Smoothness-entropy (", nclust, " clusters)"))
+
+  # show(mse_p)
+  p[[count]] <- mse_p
+  count <- count+1
+
+}
+
+
+mse_anno <- spot_entropy(coords[,c("row","col")], spe$ground_truth, k=k) %>% 
+  mean %>% setNames("annotation")
+all_mses <- append(all_mses, mse_anno)
+
+real_n <- c(real_n, length(unique(cd$ground_truth)))
+names(real_n)[length(real_n)] <- "annotation"
+
+m <- match(names(real_n), names(all_mses))
+all_mses <- all_mses[m]
+
+all(names(all_mses)==names(real_n))
+
+
+ggsave(filename = paste0("figure-3-smoothness-entropy.pdf"),
+       plot = marrangeGrob(p, nrow=1, ncol=3),
+       width = 18, height = 9)
+
+# all_mses
+
+```
+
+
+## Similarity of all clusterings
+
+```{r clustering-similarities, fig.height=9, fig.width=10}
+# keepers <- names(bases)
+aris_all <- calc_aris(cbind(base_clusterings,
+                            annotation=cd[,"ground_truth"]))
+all(colnames(aris_all) %in% names(all_mses))
+
+
+anno_row <- data.frame(entropy = all_mses)
+rownames(anno_row) <- names(all_mses)
+
+anno_row$n_clust <- as.factor(real_n[rownames(anno_row)])
+
+anno_row$panelA <- "not-shown"
+anno_row$panelA[rownames(anno_row)=="annotation"] <- "annotation"
+
+ann_colors = list(
+    panelA = c("not-shown" = "grey95", "shown" = "blue", "annotation" = "black"),
+    n_clust = c("5" = "#1B9E77", "7" = "orange", "9" = "firebrick")
+)
+
+ph_all <- pheatmap(aris_all, fontsize = 5, 
+                   annotation_row = anno_row,
+                   annotation_colors = ann_colors)
+
+clust <- cutree(ph_all$tree_row, k=2)
+calc_summary(ph_all$tree_row, aris_all, 2, "annotation")
+
+anno_row$clust <- clust[rownames(anno_row)]
+
+show_these <- anno_row %>% filter(real_n==7) %>% 
+  arrange(entropy) %>%
+  rownames_to_column("method") %>%
+  filter(method != "annotation") 
+
+qs <- quantile(1:nrow(show_these), p=(0:3)/3) %>% as.integer()
+
+show_these <- show_these %>% slice(qs) %>% pull(method)
+
+# show_this <- anno_row %>% filter(real_n==7, clust==1) %>% 
+#   arrange(desc(entropy)) %>%
+#   rownames_to_column("method") %>%
+#   filter(method != "annotation") %>% head(1) %>% pull(method)
+
+anno_row$panelA[rownames(anno_row) %in% show_these] <- "shown"
+
+# making the heatmap was here; moved below
+
+```
+
+
+## Across-clusterings-entropy for selected clusterings
+
+```{r across-clusterings-entropy, fig.width=10, fig.height=5.5}
+
+q <- vector("list", length = length(nclust_range))
+count <- 1
+
+
+cents <- matrix(0, nrow=length(nmethod_range),
+                ncol = length(nclust_range),
+                dimnames = list(nmethod_range, nclust_range))
+
+anno_row$meth <- sapply(strsplit(rownames(anno_row), "_"), .subset, 1)
+
+for(nmethod in nmethod_range) {
+  for(nclust in nclust_range) {
+    
+    long_list <- anno_row %>% 
+      filter(meth != "annotation", real_n==nclust, clust==2) %>% arrange(entropy)
+    
+    short_list <- long_list %>%
+      filter(!duplicated(meth)) %>% 
+      head(nmethod)
+      
+    # use "smoothest" as reference?
+    ref_clustering <- rownames(short_list) %>% head(1)
+    # # use "middle-smoothest" as reference?
+    # ref_clustering <- rownames(short_list)[floor(nmethod/2)]
+    # use "least-smooth" as reference
+    # ref_clustering <- rownames(short_list) %>% tail(1)
+
+    these_clusterings <- base_clusterings %>%
+      dplyr::select(rownames(short_list)) %>%
+      align_classes(ref_clustering)
+    
+    lv <- levels(these_clusterings[[ref_clustering]])
+    ps <- apply(these_clusterings, 1,
+                function(u) table(factor(u,levels = lv))) %>% t
+    
+    coords$ent <- apply(ps, 1, calc_entropy)
+    
+    cents[as.character(nmethod), as.character(nclust)] <- mean(coords$ent)
+    
+    this_title <- paste0("CME (", nclust, " clusters, ",
+                         nmethod, " methods)")
+    this_subtitle <- paste0(strwrap(paste0(rownames(short_list),
+                                           collapse = " "), width=70),
+                            collapse="\n")
+
+    ace_q <- ggplot(coords, aes(row,col,colour=ent)) +
+      geom_point(size = 1.8) +
+      scale_colour_gradient(low="gray90", high="deeppink4") +
+      theme_void() +
+      theme(legend.position = "bottom") +
+      scale_x_continuous(expand = expansion(0,1)) +
+      scale_y_reverse(expand = expansion(0,1)) +
+      coord_fixed() +
+      labs(title = this_title) +
+      #      subtitle = this_subtitle)
+      # theme(plot.title=element_text(size=8))
+      
+      cat(this_title, "\n")
+      cat(this_subtitle, "\n")
+      cat("----\n")
+    show(ace_q)
+    q[[count]] <- ace_q
+    count <- count + 1
+    
+  }
+
+}
+
+cents
+
+ggsave(filename = paste0("figure-3-across-clusterings-entropy.pdf"),
+       plot = marrangeGrob(q, nrow=1, ncol=3),
+       width = 10, height = 4)
+
+ggsave(filename = paste0("figure-3D-12methods-7clusters.pdf"),
+       plot = q[[23]],
+       width = 5, height = 5)
+
+
+
+ph_cents <- pheatmap(cents, cluster_rows = FALSE, 
+         cluster_cols = FALSE, 
+         color = colorRampPalette(c("gray90","deeppink4"))(30))
+
+save_pheatmap_pdf(ph_cents, "figure-3E-heatmap-across-entropy.pdf", 
+                  width = 3, height=5)
+
+```
+
+
+## Run leave-1-out (L1O) business
+
+
+```{r ari-leave1out}
+
+# apparently the clusters need to be numbered 1-N for LCA
+for(i in 1:ncol(base_clusterings)) {
+  base_clusterings[,i] <- base_clusterings[,i]-min(base_clusterings[,i])+1
+}
+
+hack <- grep("SOTIP", colnames(base_clusterings))
+for(i in hack) {
+  base_clusterings[,i] <- as.numeric(as.factor(base_clusterings[,i]))
+}
+
+apply(base_clusterings[,-1], 2, range)[,1:10]
+
+
+calc_ari <- mclust::adjustedRandIndex
+
+top_smoothest <- 12
+
+l1o_methods <- anno_row %>% filter(clust==2,
+                                   meth != "annotation")
+
+aris <- matrix(NA, nrow = nrow(l1o_methods),
+               ncol = 2, dimnames = list(rownames(l1o_methods),
+                                         c("ARI_L1O_consensus",
+                                           "ARI_annotation"))) %>% as.data.frame
+
+for(nclust in nclust_range) {
+  
+  cat(nclust, "----\n")
+  these_methods <- l1o_methods %>% filter(n_clust==nclust)
+  
+  for(i in 1:nrow(these_methods)) {
+    
+    this_meth <- rownames(these_methods)[i]
+    exclude <- these_methods$meth[i]
+    
+    to_combine <- these_methods %>%
+      arrange(entropy) %>%
+      filter(meth != exclude) %>%
+      filter(!duplicated(meth)) %>%
+      head(top_smoothest)
+    
+    system.time(lca_l1o <- diceR:::LCA(base_clusterings[,rownames(to_combine)],
+                                       is.relabelled = FALSE, seed = 100))
+    
+    
+    aris[this_meth,"ARI_L1O_consensus"] <- calc_ari(lca_l1o,
+                                                    base_clusterings[,this_meth])
+    aris[this_meth,"ARI_annotation"] <- calc_ari(spe$ground_truth,
+                                                 base_clusterings[,this_meth])
+    
+    cat(this_meth, "\n")
+    
+    
+  }
+  
+}
+
+
+aris$nclust <- as.factor(anno_row[rownames(aris),"n_clust"])
+
+library(ggpubr)
+
+p <- ggplot(aris, aes(x = ARI_annotation, y = ARI_L1O_consensus, 
+                      colour=nclust)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = ann_colors$n_clust) +
+  stat_cor(size = 5) +
+  xlab("ARI: annotation") + ylab("ARI: leave one out") +
+  theme_classic()
+  #theme(legend.position.inside = c(0.7, 0.7))
+
+pp <- p + guides(colour = guide_legend(position = "inside", )) +
+  theme(legend.position.inside = c(.9, .8),
+        legend.box.background = element_rect(colour = "black", 
+                                             linewidth = 1)) +
+  labs(colour = "number of\nclusters")
+#"number of clusters"))
+
+ggsave("figure-3C-aris-L1O-anno.pdf", pp, height = 4.5, width = 5)
+
+
+```
+
+
+## Making the 6 domains map
+
+```{r}
+
+(show_set <- c(show_these, "annotation"))
+
+use_these <- anno_row %>% filter(real_n==7, clust==2) %>% 
+  arrange(entropy) %>%
+  rownames_to_column("method") %>%
+  filter(method != "annotation") %>% head(12) %>% pull(method)
+
+all(rownames(coords)==rownames(cd))
+all(rownames(coords)==rownames(these_clusterings))
+
+df <- cbind(base_clusterings[,setdiff(show_set,"annotation")], 
+            coords, annotation=cd$ground_truth)
+
+all(rownames(df)==rownames(base_clusterings))
+
+df$consensus_lca <- diceR:::LCA(base_clusterings[,use_these],
+                                       is.relabelled = FALSE, seed = 100)
+
+se <- spot_entropy(coords[,c("row","col")],
+                   df$consensus_lca, k=k) %>% mean
+names(se) <- "consensus_lca"
+
+all_mses <- c(all_mses, se)
+
+show_set <- c(show_set, "consensus_lca")
+head(df, 2)
+
+palette <- readRDS("libd_color_code.rds")
+
+
+df[,show_set] <- df[,show_set] %>%
+  align_classes("annotation")
+
+# nclust <- 7
+# palette <- distinctColorPalette(nclust)
+plots <- vector("list", 6)
+count <- 0
+
+borders <- rep("blue", length(show_set)) %>% setNames(show_set)
+borders["annotation"] <- "black"
+borders["consensus_lca"] <- "white"
+
+
+titles <- show_set %>% setNames(show_set)
+titles["BANKSY_starmap_7"] <- paste0("5. ", titles["BANKSY_starmap_7"]) 
+titles["SOTIP_Visium_dlpfc_7"] <- paste0("2. ", titles["SOTIP_Visium_dlpfc_7"]) 
+titles["precast_default_7"] <- paste0("3. ", titles["precast_default_7"]) 
+titles["meringue_mob_7"] <- paste0("4. ", titles["meringue_mob_7"]) 
+titles["annotation"] <- paste0("1. ", titles["annotation"]) 
+titles[" "] <- " "
+
+for(meth in show_set) {
+  
+  df$this_base <- as.factor(df[[meth]])
+  n_palette <- length(levels(df$this_base))
+  names(palette)[seq_len(n_palette)] <- levels(df$this_base)
+  aa <- ggplot(df, aes(x=row, y=col, colour=this_base)) + 
+    geom_point(size = .7) +
+    theme_void() +
+    theme(legend.position = "none") +
+    xlab("") + ylab("") +
+    scale_colour_manual(values = palette) +
+    scale_x_continuous(expand = expansion(0,1)) +
+    # scale_y_continuous(expand = expansion(0,1)) +
+    ggtitle(paste0(titles[meth], " SE=", round(all_mses[meth], 3))) +
+    coord_fixed() +
+    scale_y_reverse(expand = expansion(0,1)) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm"),
+          plot.title = element_text(size = 9.5),
+          panel.border = element_rect(colour = borders[meth], fill=NA, linewidth=2))
+  count <- count+1
+  plots[[count]] <- aa
+  
+  
+}
+
+ggsave("figure-3A-6methods-exemplary.pdf",
+       plot_grid(plotlist = plots, nrow=3), height = 7.5, width = 4.5)
+
+
+```
+
+
+
+## Making the heatmaps here
+
+```{r}
+# ph_all <- pheatmap(aris_all, fontsize = 5, 
+#                    annotation_row = anno_row, 
+#                    show_rownames = FALSE,
+#                    show_colnames = FALSE,
+#                    annotation_colors = ann_colors)
+# 
+# 
+# 
+# save_pheatmap_pdf(ph_all, "figure-3-heatmap-all-withlabels-supplement.pdf", 
+#                   width = 9, height=8)
+
+colnames(aris_all)[anno_row$panelA=="not-shown"] <- " "
+
+ann_colors$SE <- colorRampPalette(RColorBrewer::brewer.pal(n = 7,
+                                name = "Purples"))(4)
+
+
+greens <- colorRampPalette(RColorBrewer::brewer.pal(n = 7,
+                                name = "Greens"))(100)
+
+titles_chop <- titles
+titles_chop[grepl("^[0-9]", titles)] <- substr(titles[grepl("^[0-9]", titles)], 1, 2)
+
+ph_all <- pheatmap(aris_all, fontsize = 8,
+                   treeheight_row = 15,
+                   treeheight_col = 15,
+                   show_rownames = TRUE,
+                   show_colnames = FALSE,
+                   color = greens,
+                   angle_col = 45,
+                   labels_row = titles_chop[colnames(aris_all)],
+                   annotation_row = anno_row %>% mutate(SE = entropy) %>% 
+                     dplyr::select(-clust, -meth, -entropy), 
+                     #dplyr::select(-meth, -entropy), 
+                   #annotation_col = anno_row %>% dplyr::select(annotation), 
+                   annotation_colors = ann_colors,
+                   cutree_rows = 4, cutree_cols = 4)
+
+
+
+# https://stackoverflow.com/questions/78248771/how-to-use-pheatmap-in-r-to-draw-a-box-outside-a-pheatmap-plot-and-save-them-tog
+# (65+1)/(117+3)
+library(grid)
+rect1 <- ph_all$gtable$grobs[[3]]$children[[1]]
+rect2 <- grid::rectGrob(x = unit(0,"npc"), 
+                        y = unit(1-(67+1)/(120+3),"npc"),
+                        width = unit((67+1)/(120+3), "npc"), 
+                        height = unit((67+1)/(120+3), "npc"),
+                        just=c("left", "bottom"),
+                        gp=gpar(col="blue", fill="transparent", lex=3))
+rect3 <- grid::rectGrob(x = unit(13/(120+3),"npc"), 
+                        y = unit(((120+3)-68)/(120+3),"npc"),
+                        width = unit((55)/(120+3), "npc"), 
+                        height = unit((55)/(120+3), "npc"),
+                        just=c("left", "bottom"),
+                        gp=gpar(col="salmon", fill="transparent", lex=3, lty=3))
+
+ph_all$gtable$grobs[[3]] <- gTree(children=gList(rect1, rect2, rect3))
+
+show(ph_all)
+
+save_pheatmap_pdf(ph_all, "figure-3B-heatmap-all-withoutlabels-main.pdf", 
+                  width = 8, height=7)
+
+```
+
+
+## Read in clusterings from all LIBD slices and plot heatmaps
+
+```{r}
+
+fs <- dir(pattern = "combined_methods.tsv", 
+          path = file.path(datadir, "libd_dlpfc"),
+          recursive = TRUE, full.names = TRUE)
+
+ss <- strsplit(fs, "/")
+names(fs) <- sapply(ss, .subset, 4)
+
+
+tsvs <- lapply(fs, function(u) {
+ d <- read_tsv(u, show_col_types = FALSE)
+ colnames(d)[1] <- "barcode_id"
+ d %>% column_to_rownames("barcode_id")
+})
+
+
+pdf("SuppFig-DPLFC-ARI-heatmaps-all-slices.pdf", height = 10, width = 10)
+
+for(i in 1:length(tsvs)) {
+  real_n <- apply(tsvs[[i]], 2, 
+                  function(u) length(unique(u)))
+  aris_this <- calc_aris(tsvs[[i]][real_n %in% c(5,7,9)])
+  ph_this <- pheatmap(aris_this, fontsize = 6, main = names(tsvs)[i])
+  # grid::grid.newpage()
+  # grid::grid.draw(ph_all$gtable)
+  cat(names(tsvs)[i],"\n")
+}
+
+dev.off()
+
+
+```
+
+
+## sessionInfo()
+
+```{r sessioninfo}
+sessionInfo()
+```
+
