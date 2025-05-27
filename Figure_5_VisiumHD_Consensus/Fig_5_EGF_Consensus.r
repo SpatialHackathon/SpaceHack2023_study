@@ -129,3 +129,16 @@ p_vhd <- lapply(names(n_clust),
 ggsave("supp_VisiumHD_BCs.pdf", 
        plot = marrangeGrob(p_vhd, ncol=4, nrow=3),
        width=8, height=8)
+
+###### Supplementary figure: base clusterings for full HD dataset
+coi <- read.delim("data/full_HD_results_used.tsv", row.names=1, header=TRUE)
+
+real_n <- apply(coi, 2, function(u) length(unique(u)))
+real_n <- real_n[which(real_n == 9)]
+
+p_fhd <- lapply(names(real_n), 
+                plot_clusters, data=coi, color_palette=palette, ps=0.01)
+
+ggsave("supp_VisiumHD_full_BCs.pdf", 
+       plot = marrangeGrob(p_fhd, ncol=4, nrow=4),
+       width=8, height=8)
