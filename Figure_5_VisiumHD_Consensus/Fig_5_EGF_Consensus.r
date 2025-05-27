@@ -34,8 +34,8 @@ palette <- distinctColorPalette(k=10)
 
 plot_clusters <- function(label, data, color_palette, ps=0.01){
   color_palette <- color_palette[1:length(unique(data[[label]]))] %>% setNames(unique(data[[label]]))
-  con_p <- ggplot(data, aes(row, col, colour=as.factor(.data[[label]]))) + 
-    geom_point(size = ps) %>% ggrastr::rasterise() +
+  con_p <- ggplot(data, aes(col, row, colour=as.factor(.data[[label]]))) + 
+    geom_point(size = ps) +
     theme_classic() +
     theme(legend.position = "none", 
         axis.title.x=element_blank(),
@@ -127,5 +127,5 @@ p_vhd <- lapply(names(n_clust),
                 plot_clusters, data=df, color_palette=palette, ps=0.01)
 
 ggsave("supp_VisiumHD_BCs.pdf", 
-       plot = marrangeGrob(p_vhd, ncol=2, nrow=2),
+       plot = marrangeGrob(p_vhd, ncol=4, nrow=3),
        width=8, height=8)
