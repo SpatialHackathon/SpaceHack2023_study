@@ -1,0 +1,327 @@
+---
+title: |
+  Code for Figure 4 + Supp Figs
+format: 
+    html:
+      toc: true
+      self-contained: true
+      highlight-style: github
+      code-line-numbers: true
+      code-fold: true
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+## Define parameters
+
+```{r display-params}
+datadir <- "data/"
+```
+
+## Packages / functions
+
+```{r load-packages, eval=TRUE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(cowplot)
+  library(tibble)
+  library(pheatmap)
+  library(randomcoloR)
+  library(gridExtra)
+  library(clue)
+  library(khroma)
+  library(scran)
+  library(limma)
+  library(tibble)
+  library(readr)
+  library(ggrepel)
+  library(mclust)
+  library(pheatmap)
+  library(fastDummies)
+  library(randomcoloR)
+  library(reshape2)
+  library(gridExtra)
+  library(networkD3)
+})
+
+source("utils.R")
+```
+
+
+# Consensus analysis
+
+```{r load data and parameters}
+# Load data frame from the combined base clustering results
+df <- read.table("data/combined_results.tsv", sep="\t", stringsAsFactors = FALSE, row.names=1)
+colnames(df) <- gsub("-", "", colnames(df))
+
+# mses <- read.table("data/Mean_SE.tsv")
+col_metadata <- c("id", "row","col", "parcellation_structure", "parcellation_substructure")
+base_clusterings <- df[, setdiff(colnames(df), col_metadata)]
+```
+
+```{r calculate mean SE}
+ses <- apply(base_clusterings, 2, function(u) spot_entropy(df[,c("row","col")], u))
+mses <- colMeans(ses)
+```
+
+Here we demonstrate how to generate the consensus for nclust=20. For ncluster=16 and 24, it uses the same code to generate the results. You can define a yaml file to specify the parameter as input or running some customized loop structure.
+
+```{r, quality control and BC selection}
+nmethod <- 8
+nclust <- 20
+
+# find number of actual clusters per column
+real_n <- apply(all_methods, 2, 
+                function(u) length(unique(u)))
+real_n <- real_n[which(real_n == nclust)]
+
+# Filter out some base clusterings based on expert suggestions
+real_n <- real_n[!startsWith(names(real_n), "seurat") &   # Non-spatial methods
+                  !startsWith(names(real_n), "scanpy") &  # Non-spatial methods
+                  !startsWith(names(real_n), "SOTIP") &   # Class-imblanced methods
+                  !startsWith(names(real_n), "STAGATE_starmap") & # patchy structure
+                  !startsWith(names(real_n), "stardust")  # salt and pepper noises
+                  ]
+
+# sort the cluster based on the smooth-ness level and only take the smoothest n methods
+meths <- mses[names(real_n)] %>% sort()
+# Keep only the first one in each method to remove domination of one single method
+meths <- meths[which(!duplicated(sub("_.*", "", names(meths))))] %>%
+          head(min(nmethod, length(real_n)))
+
+base_clusterings <- all_methods %>%
+dplyr::select(names(meths)) %>%
+align_classes(names(meths)[1])
+```
+
+```{r run consensus}
+df[[sprintf("consensus_lca_%s", nclust)]] <- diceR:::LCA(base_clusterings,
+                                                is.relabelled = FALSE, seed = 100)
+df[[sprintf("consensus_kmodes_%s", nclust)]] <- diceR:::k_modes(base_clusterings,
+                                                        is.relabelled = FALSE, seed = 1)
+# Get binary matrix for individual clustering
+binary_matrices <- lapply(base_clusterings, get_binary_matrix)
+
+# Get consensus clustering from KL EnSDD method
+ensemble_result <- solve_ensemble(Results.clustering = binary_matrices, verbose=TRUE)
+
+# Ensemble labelling
+ensemble_label <- get_cluster_label(ensemble_result$H, n_clust_target=nclust, verbose=FALSE)
+
+# Save ensemble results
+df[[sprintf("consensus_weighted_%s", nclust)]] <- ensemble_label
+```
+
+# Plotting Figures
+
+```{r plotting preparation}
+# Define parameters
+pt_size <- 0.5
+gt <- "parcellation_structure"
+
+# Set up color palette
+set.seed(2025)
+palette <- distinctColorPalette(24)
+
+# Subsetting dataframes
+con_names <- paste0(c("consensus_weighted_", "consensus_kmodes_", "consensus_lca_"), nclust)
+coi <- df[,c( "row", "col", names(meths), con_names, gt)]
+```
+
+### 4A - label spatial plots
+
+```{r plot GT label}
+# Ground truth label plots
+this_palette <- palette[1:length(unique(coi[[gt]]))] %>% setNames(unique(coi[[gt]]))
+gt_p <- ggplot(coi, aes(row, col, colour=as.factor(.data[[gt]]))) + 
+  geom_point(size = pt_size) +
+  theme_classic() +
+  theme(legend.position = "none", 
+      axis.title.x=element_blank(),
+      axis.text.x=element_blank(),
+      axis.ticks.x=element_blank(),
+      axis.title.y=element_blank(),
+      axis.text.y=element_blank(),
+      axis.ticks.y=element_blank()) +
+  xlab("") + ylab("") +
+  labs(color='"GT"') +
+  scale_colour_manual(values = this_palette) +
+  scale_x_continuous(expand = expansion(0,1)) +
+  scale_y_continuous(expand = expansion(0,1)) +
+  ggtitle(gt) + coord_fixed()
+
+ggsave("gt_label.pdf", gt_p, width = 8, height=6)
+```
+
+## 4B - BC-pairwise ARI
+
+```{r pairwise ARI Heatmap}
+aris_all <- calc_aris(coi[,c(names(meths), gt)])
+greens <- colorRampPalette(RColorBrewer::brewer.pal(n = 7, name = "Greens"))(100)
+
+ph_all <- pheatmap(aris_all, 
+                   fontsize = 8, 
+                   treeheight_row = 0,
+                   treeheight_col = 20,
+                   main='Cross method ARI', 
+                   labels_row = sub("_.*$", "", rownames(aris_all)),
+                   labels_col = sub("_.*$", "", colnames(aris_all)),
+                   color = greens)
+
+ggsave("ari_heatmap.pdf"), ph_all[[4]], width = 4, height = 4)
+# write.table(aris_all, "data/pairwise_ari.tsv"), sep = "\t")
+```
+
+## 4C - CME between BCs
+
+```{r CME spatial plots}
+these_clusterings <- coi[, names(meths)] %>% align_classes(names(meths)[1])
+lv <- levels(these_clusterings[[names(meths)[1]]])
+ps <- apply(these_clusterings, 1, function(u) table(factor(u, levels=lv))) %>% t
+coi$ent_bc <- apply(ps, 1, calc_entropy)
+
+cme_p <- ggplot(coi, aes(row, col, colour=ent_bc)) +
+  geom_point(size = pt_size) +
+  scale_colour_gradient(low="gray90", high="deeppink4") +
+  theme_classic() +
+  theme(legend.position = "bottom", 
+      axis.title.x=element_blank(),
+      axis.text.x=element_blank(),
+      axis.ticks.x=element_blank(),
+      axis.title.y=element_blank(),
+      axis.text.y=element_blank(),
+      axis.ticks.y=element_blank()) +
+  scale_x_continuous(expand = expansion(0,1)) +
+  scale_y_continuous(expand = expansion(0,1)) +
+  coord_fixed() +
+  labs(subtitle = sprintf("mean entropy: %.4f", mean(coi[["ent_bc"]])), 
+       colour = "CME")
+
+cme_p
+```
+
+## 4FGH - Consensus plots
+
+```{r Consensus Plots}
+# Plot the spot-wise entropy
+con_p <- lapply(con_names, function(con){
+  this_palette <- palette[1:length(unique(coi[[con]]))] %>% setNames(unique(coi[[con]]))
+  con_p <- ggplot(coi, aes(row, col, colour=as.factor(.data[[con]]))) + 
+    geom_point(size = pt_size) +
+    theme_classic() +
+    theme(legend.position = "none", 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+    # xlab("") + ylab("") +
+    scale_colour_manual(values = this_palette) +
+    scale_x_continuous(expand = expansion(0,1)) +
+    scale_y_continuous(expand = expansion(0,1)) +
+    ggtitle("consensus") + coord_fixed()
+  return(con_p)
+})
+
+con_p
+```
+
+## 4E - cluster sweep and sankey plots
+
+```{r load data and filter out clusters}
+con_df <- read.delim("data/consensus_results.tsv", stringsAsFactors = FALSE, row.names=1,  header=TRUE)
+
+# Calculate the sanky-graph
+nclust_list <- c(16, 20, 24)
+con_names <- paste0("consensus_weighted_", nclust_list)
+
+#### Plot the clustering map with only partial cluster highlighted
+con_df$con_weight_16_selected <- ifelse(con_df$consensus_weighted_16 == 0, 0, "rest")
+con_df$con_weight_20_selected <- ifelse(con_df$consensus_weighted_20 %in% c(1,2), con_df$consensus_weighted_20, "rest")
+
+pal_16_s<- c("0" = "#b0a1ce", 
+             "rest"= "grey80")
+
+pal_20_s <- c("1" = "#b0a1ce", 
+              "2" = "#7dc355", 
+              "rest"= "grey80")  
+
+p_16_hl <- plot_clusters(label="con_weight_16_selected", data=con_df, color_palette = pal_16_s)
+p_20_hl <- plot_clusters(label="con_weight_20_selected", data=con_df, color_palette = pal_20_s)
+p_24 <- plot_clusters(label=con_names[3], data=con_df, color_palette = palette)
+)
+
+grid.arrange(p_16_hl, p_20_hl, p_24, ncol=2)
+
+#### Plot the corresponding sankey map
+getFlowDF <- function(df, cols, s_prefix="", t_prefex="",  threshold=10){
+  s_df <-  df[, cols] %>% table() %>% melt()
+  s_df <-  s_df[s_df$value > threshold,]
+
+  s_df[, 1] <- paste0(s_prefix, s_df[,1])
+  s_df[, 2] <- paste0(t_prefex, s_df[,2])
+
+  colnames(s_df) <- c("Source", "Target", "value")
+  return(s_df)
+}
+
+Con_16_20 <- getFlowDF(con_df, cols = con_names[1:2], s_prefix = "a_", t_prefex = "b_")
+Con_20_24 <- getFlowDF(con_df, cols = con_names[2:3], s_prefix = "b_", t_prefex = "c_")
+
+Con_flow <- rbind(Con_16_20, Con_20_24)
+
+# Filter Con_flow to only highlighted clusters
+Con_flow <- Con_flow[Con_flow$Source %in% c("a_0", "b_1", "b_2"),]
+
+# Generate the node variable
+node_df <- data.frame(name = Con_flow[, 1:2] %>% unlist() %>% unique())
+
+
+Con_flow_ind <- Con_flow
+Con_flow_ind[,1] <- match(Con_flow[,1], node_df$name)-1
+Con_flow_ind[,2] <- match(Con_flow[,2], node_df$name)-1
+
+# Sanky plot 
+p <- sankeyNetwork(Links = Con_flow_ind, 
+              Source = "Source", 
+              Target = "Target", 
+              Value = "value",
+              Nodes = node_df,
+              NodeID = "name", 
+              fontSize = 0,
+              height=300, 
+              width = 700)
+
+require(htmlwidgets)
+saveWidget(p, file="sankey.html")
+```
+
+## Supp figure - cluster spatial results
+
+```{r spatial plots of clusters}
+bc_plots <- lapply(names(meths), function(con){
+  this_palette <- palette[1:length(unique(coi[[con]]))] %>% setNames(unique(coi[[con]]))
+  con_p <- ggplot(coi, aes(row, col, colour=as.factor(.data[[con]]))) + 
+    geom_point(size = pt_size) +
+    theme_classic() +
+    theme(legend.position = "none", 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+    # xlab("") + ylab("") +
+    scale_colour_manual(values = this_palette) +
+    scale_x_continuous(expand = expansion(0,1)) +
+    scale_y_continuous(expand = expansion(0,1)) +
+    ggtitle("consensus") + coord_fixed()
+  return(con_p)
+})
+
+grid.arrange(grobs=bc_plots, ncol=2)
+```
